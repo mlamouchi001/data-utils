@@ -26,6 +26,16 @@ from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree as ET
 
+# Force UTF-8 sur stdout/stderr pour éviter les UnicodeEncodeError sur Windows
+# lorsque la sortie est redirigée ou pipée (cp1252 par défaut).
+for _stream_name in ("stdout", "stderr"):
+    _s = getattr(sys, _stream_name, None)
+    if _s is not None and hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 # --------------------------------------------------------------------------
 # Catalogue des composants Talend (entrée / sortie)
@@ -127,25 +137,72 @@ def find_job_item(project_dir: Path, job_name: str) -> Optional[Path]:
     return None
 
 
-def build_id_to_name_map(project_dir: Path) -> dict[str, str]:
+def build_id_to_name_map(project_dir: Path,
+                         verbose: bool = False) -> dict[str, str]:
     """
     Construit un mapping {job_id_talend: label_du_job} à partir des fichiers
-    .properties. Utile quand tRunJob référence un sous-job par son ID interne
-    plutôt que par son nom.
+    .properties de Talend. Utile quand tRunJob référence un sous-job par son
+    ID interne plutôt que par son nom.
+
+    Structure réelle des .properties Talend Studio :
+        <xmi:XMI xmlns:xmi="..." xmlns:TalendProperties="...">
+          <TalendProperties:Property id="_xxx" label="JOB_NAME" ...>
+            ...
+          </TalendProperties:Property>
+        </xmi:XMI>
+
+    Certains export plus anciens / simplifiés ont Property directement en
+    racine. On gère les deux cas.
     """
     mapping: dict[str, str] = {}
+    scanned = 0
+    errors = 0
+
     for props in project_dir.rglob("*.properties"):
         if "/context/" in str(props).replace("\\", "/"):
             continue
+        scanned += 1
         try:
             tree = ET.parse(props)
         except ET.ParseError:
+            errors += 1
             continue
+
         root = tree.getroot()
-        label = root.get("label")
-        id_ = root.get("id")
-        if label and id_:
-            mapping[id_] = label
+
+        # 1. Racine = Property (ancien format / fixture simple)
+        rlabel = root.get("label")
+        rid = root.get("id")
+        if rlabel and rid:
+            mapping[rid] = rlabel
+            continue
+
+        # 2. Property imbriqué quelque part (format Talend Studio standard)
+        #    On cherche tout élément dont le nom local est 'Property'
+        found = False
+        for prop in iter_local(root, "Property"):
+            lbl = prop.get("label") or prop.get("displayName")
+            pid = prop.get("id")
+            if lbl and pid:
+                mapping[pid] = lbl
+                found = True
+                break
+
+        # 3. Fallback ultime : n'importe quel élément avec label+id
+        if not found:
+            for elem in root.iter():
+                lbl = elem.get("label") or elem.get("displayName")
+                eid = elem.get("id")
+                if lbl and eid and eid.startswith("_"):
+                    mapping[eid] = lbl
+                    break
+
+    if verbose:
+        print(f"  [debug] {scanned} .properties scannés, "
+              f"{len(mapping)} IDs indexés"
+              + (f" ({errors} erreurs de parsing)" if errors else ""),
+              file=sys.stderr)
+
     return mapping
 
 
@@ -399,11 +456,18 @@ def extract_subjob_name(node: ET.Element,
         return None
 
     # Résolution par ID Talend
-    if cleaned.startswith("_") and cleaned in id_to_name:
-        resolved = id_to_name[cleaned]
-        if verbose:
-            print(f"    [debug] ID {cleaned} résolu -> {resolved}", file=sys.stderr)
-        return resolved
+    if cleaned.startswith("_"):
+        if cleaned in id_to_name:
+            resolved = id_to_name[cleaned]
+            if verbose:
+                print(f"    [debug] ID {cleaned} résolu -> {resolved}",
+                      file=sys.stderr)
+            return resolved
+        else:
+            print(f"  ⚠ ID Talend '{cleaned}' introuvable dans les "
+                  f".properties scannés. Vérifier que le sous-job existe "
+                  f"dans le projet ciblé.", file=sys.stderr)
+            return cleaned
 
     return cleaned
 
@@ -528,10 +592,7 @@ def analyze_recursive(project_dir: Path,
         for cname, cpath in find_context_files(project_dir).items():
             ext_contexts_cache[cname] = parse_context_file(cpath, context_env)
     if id_to_name is None:
-        id_to_name = build_id_to_name_map(project_dir)
-        if verbose:
-            print(f"  [debug] {len(id_to_name)} IDs Talend indexés",
-                  file=sys.stderr)
+        id_to_name = build_id_to_name_map(project_dir, verbose=verbose)
 
     # Contextes embarqués dans le .item du job
     job_ctx = extract_job_contexts(item_path, context_env)
