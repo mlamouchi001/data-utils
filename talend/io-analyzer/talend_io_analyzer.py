@@ -88,6 +88,28 @@ PATH_PARAMETER_NAMES = {
 
 
 # --------------------------------------------------------------------------
+# Helpers XML tolérants aux namespaces
+# --------------------------------------------------------------------------
+def local_name(tag: str) -> str:
+    """Retourne le nom local d'une balise en strippant le namespace
+    ('{ns}node' -> 'node', 'node' -> 'node')."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def iter_local(root: ET.Element, name: str):
+    """Itère récursivement sur les éléments dont le nom local vaut `name`,
+    peu importe le namespace."""
+    for elem in root.iter():
+        if local_name(elem.tag) == name:
+            yield elem
+
+
+def find_local(elem: ET.Element, name: str) -> list[ET.Element]:
+    """Retourne les enfants directs dont le nom local vaut `name`."""
+    return [c for c in elem if local_name(c.tag) == name]
+
+
+# --------------------------------------------------------------------------
 # Recherche de fichiers dans le projet
 # --------------------------------------------------------------------------
 def find_job_item(project_dir: Path, job_name: str) -> Optional[Path]:
@@ -141,7 +163,7 @@ def collect_available_contexts(project_dir: Path,
         item = find_job_item(project_dir, job_name)
         if item:
             try:
-                for ctx in ET.parse(item).getroot().iter("context"):
+                for ctx in iter_local(ET.parse(item).getroot(), "context"):
                     name = ctx.get("name")
                     if name:
                         envs.add(name)
@@ -151,7 +173,7 @@ def collect_available_contexts(project_dir: Path,
     # Contextes externes (dossier context/)
     for cpath in find_context_files(project_dir).values():
         try:
-            for ctx in ET.parse(cpath).getroot().iter("context"):
+            for ctx in iter_local(ET.parse(cpath).getroot(), "context"):
                 name = ctx.get("name")
                 if name:
                     envs.add(name)
@@ -203,9 +225,9 @@ def parse_context_file(item_path: Path,
     contexts_by_env: dict[str, dict[str, str]] = defaultdict(dict)
 
     # Format multi-environnements: <context name="ENV"><contextParameter ...>
-    for ctx in root.iter("context"):
+    for ctx in iter_local(root, "context"):
         env_name = ctx.get("name", "Default")
-        for cp in ctx.iter("contextParameter"):
+        for cp in iter_local(ctx, "contextParameter"):
             pname = cp.get("name")
             pvalue = cp.get("value", "") or cp.get("rawValue", "")
             if pname:
@@ -213,7 +235,7 @@ def parse_context_file(item_path: Path,
 
     if not contexts_by_env:
         # Format simple: <contextParameter name="..." value="...">
-        for cp in root.iter("contextParameter"):
+        for cp in iter_local(root, "contextParameter"):
             pname = cp.get("name")
             pvalue = cp.get("value", "")
             if pname:
@@ -301,8 +323,9 @@ class JobIO:
 
 
 def get_node_param(node: ET.Element, param_name: str) -> Optional[str]:
-    """Récupère la valeur d'un <elementParameter name=...>."""
-    for ep in node.findall("elementParameter"):
+    """Récupère la valeur d'un <elementParameter name=...>
+    (tolérant aux namespaces)."""
+    for ep in iter_local(node, "elementParameter"):
         if ep.get("name") == param_name:
             return ep.get("value")
     return None
@@ -313,43 +336,69 @@ def extract_subjob_name(node: ET.Element,
                         verbose: bool = False) -> Optional[str]:
     """
     Extrait le nom du sous-job appelé par un tRunJob / tRunJobOnGrid.
-    Supporte les deux formats Talend :
-      1. Plat    : <elementParameter name="PROCESS:PROCESS_TYPE_PROCESS" value="..."/>
-      2. Imbriqué: <elementParameter name="PROCESS">
-                       <elementValue elementRef="PROCESS_TYPE_PROCESS" value="..."/>
-                   </elementParameter>
-    Si la valeur ressemble à un ID Talend, on la résout via id_to_name.
+    Supporte tous les formats Talend connus :
+      1. Plat        : <elementParameter name="PROCESS:PROCESS_TYPE_PROCESS" value="..."/>
+      2. Imbriqué    : <elementParameter name="PROCESS">
+                           <elementValue elementRef="PROCESS_TYPE_PROCESS" value="..."/>
+                       </elementParameter>
+      3. Variante    : elementValue avec attribut @name au lieu de @elementRef
+    Si la valeur ressemble à un ID Talend (_xxxxx), on la résout via id_to_name.
     """
     raw: Optional[str] = None
 
     # Format 1 : paramètre plat
-    flat = get_node_param(node, "PROCESS:PROCESS_TYPE_PROCESS")
-    if flat:
-        raw = flat
+    for candidate in ("PROCESS:PROCESS_TYPE_PROCESS",
+                      "PROCESS_TYPE_PROCESS"):
+        flat = get_node_param(node, candidate)
+        if flat:
+            raw = flat
+            break
 
     # Format 2 : paramètre imbriqué avec <elementValue>
     if not raw:
-        for ep in node.findall("elementParameter"):
-            if ep.get("name") == "PROCESS":
-                for ev in ep.findall("elementValue"):
-                    if ev.get("elementRef") == "PROCESS_TYPE_PROCESS":
-                        raw = ev.get("value")
-                        break
+        for ep in iter_local(node, "elementParameter"):
+            pname = ep.get("name", "")
+            if pname not in ("PROCESS", "PROCESS_TYPE_PROCESS"):
+                continue
+            # on essaie @value direct d'abord
+            if ep.get("value"):
+                raw = ep.get("value")
                 break
+            # puis les <elementValue> enfants
+            for ev in iter_local(ep, "elementValue"):
+                ref = ev.get("elementRef") or ev.get("name") or ""
+                if "PROCESS_TYPE_PROCESS" in ref or ref == "PROCESS":
+                    raw = ev.get("value")
+                    if raw:
+                        break
+            if raw:
+                break
+
+    # Format 3 : fallback ultime - tout elementParameter avec PROCESS dans le nom
+    if not raw:
+        for ep in iter_local(node, "elementParameter"):
+            if "PROCESS_TYPE_PROCESS" in (ep.get("name") or ""):
+                raw = ep.get("value")
+                if raw:
+                    break
 
     if not raw:
         if verbose:
             unique = get_node_param(node, "UNIQUE_NAME") or "?"
-            print(f"    [debug] tRunJob sans paramètre PROCESS détecté: {unique}",
+            print(f"    [debug] tRunJob sans paramètre PROCESS reconnu: {unique}",
                   file=sys.stderr)
         return None
 
-    # Nettoyage : guillemets, suffixe de version éventuel après ':'
-    cleaned = raw.strip().strip('"').split(":")[0].strip()
+    # Nettoyage : guillemets
+    cleaned = raw.strip().strip('"').strip()
+    # Certains formats stockent "JOB_NAME:version:ID" -> on garde le premier
+    if ":" in cleaned and not cleaned.startswith("_"):
+        cleaned = cleaned.split(":")[0].strip()
+
     if not cleaned:
         return None
 
-    # Si ça ressemble à un ID Talend (commence par '_') on résout
+    # Résolution par ID Talend
     if cleaned.startswith("_") and cleaned in id_to_name:
         resolved = id_to_name[cleaned]
         if verbose:
@@ -363,7 +412,8 @@ def analyze_job(job_name: str,
                 item_path: Path,
                 context_values: dict[str, str],
                 id_to_name: Optional[dict[str, str]] = None,
-                verbose: bool = False) -> JobIO:
+                verbose: bool = False,
+                dump_runjobs: bool = False) -> JobIO:
     """Analyse un job Talend et extrait ses I/O + ses sous-jobs."""
     result = JobIO(job_name, item_path)
     id_to_name = id_to_name or {}
@@ -376,19 +426,42 @@ def analyze_job(job_name: str,
 
     root = tree.getroot()
 
-    for node in root.iter("node"):
+    all_nodes = list(iter_local(root, "node"))
+    if verbose:
+        print(f"    [debug] {len(all_nodes)} <node> trouvés dans {item_path.name}",
+              file=sys.stderr)
+
+    for node in all_nodes:
         comp_name = node.get("componentName", "")
         unique_name_raw = get_node_param(node, "UNIQUE_NAME") or ""
         unique_name = unique_name_raw.strip('"') or comp_name
 
-        # tRunJob -> on enregistre le sous-job pour analyse récursive
-        if comp_name in ("tRunJob", "tRunJobOnGrid"):
+        # Détection élargie : tRunJob, tRunJobOnGrid, toute variante tRunJob*
+        if comp_name.startswith("tRunJob"):
+            if dump_runjobs:
+                print(f"\n--- DUMP tRunJob: {unique_name} "
+                      f"(componentName={comp_name}) dans {job_name} ---",
+                      file=sys.stderr)
+                # On reconstruit un XML lisible du node
+                dump = ET.tostring(node, encoding="unicode")
+                print(dump, file=sys.stderr)
+                print("--- FIN DUMP ---", file=sys.stderr)
+
             subjob_name = extract_subjob_name(node, id_to_name, verbose)
             if subjob_name and subjob_name not in result.subjobs:
                 result.subjobs.append(subjob_name)
-            elif verbose and not subjob_name:
-                print(f"    [debug] tRunJob non résolu dans {job_name} ({unique_name})",
+                if verbose:
+                    print(f"    [debug] tRunJob {unique_name} -> {subjob_name}",
+                          file=sys.stderr)
+            elif not subjob_name:
+                # On liste les paramètres présents pour aider au diagnostic
+                params = [ep.get("name") for ep in iter_local(node, "elementParameter")]
+                print(f"  ⚠ tRunJob '{unique_name}' dans {job_name} : "
+                      f"nom du sous-job non résolu",
                       file=sys.stderr)
+                if verbose:
+                    print(f"    [debug] paramètres présents: {params}",
+                          file=sys.stderr)
             continue
 
         is_input = comp_name in INPUT_COMPONENTS
@@ -400,7 +473,7 @@ def analyze_job(job_name: str,
 
         # On collecte tous les paramètres de chemin
         paths_found = []
-        for ep in node.findall("elementParameter"):
+        for ep in iter_local(node, "elementParameter"):
             pname = ep.get("name", "")
             pvalue = ep.get("value", "")
             if pname.upper() in PATH_PARAMETER_NAMES and pvalue:
@@ -434,7 +507,8 @@ def analyze_recursive(project_dir: Path,
                       ext_contexts_cache: Optional[dict[str, dict[str, str]]] = None,
                       id_to_name: Optional[dict[str, str]] = None,
                       visited: Optional[set[str]] = None,
-                      verbose: bool = False) -> list[JobIO]:
+                      verbose: bool = False,
+                      dump_runjobs: bool = False) -> list[JobIO]:
     """Analyse un job et descend récursivement dans tous ses tRunJob."""
     if visited is None:
         visited = set()
@@ -470,13 +544,14 @@ def analyze_recursive(project_dir: Path,
     if verbose:
         print(f"  [debug] Analyse de {job_name} ({item_path})", file=sys.stderr)
 
-    job_io = analyze_job(job_name, item_path, job_ctx, id_to_name, verbose)
+    job_io = analyze_job(job_name, item_path, job_ctx, id_to_name,
+                         verbose, dump_runjobs)
     results = [job_io]
 
     for subjob in job_io.subjobs:
         results.extend(analyze_recursive(
             project_dir, subjob, context_env,
-            ext_contexts_cache, id_to_name, visited, verbose,
+            ext_contexts_cache, id_to_name, visited, verbose, dump_runjobs,
         ))
 
     return results
@@ -648,6 +723,11 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Mode diagnostic : affiche les étapes d'analyse "
                              "et la résolution des sous-jobs sur stderr")
+    parser.add_argument("--dump-runjobs", action="store_true",
+                        help="Dump sur stderr le XML brut de chaque composant "
+                             "tRunJob* trouvé. Utile pour me partager le format "
+                             "exact de ton projet si les sous-jobs ne sont pas "
+                             "détectés.")
     args = parser.parse_args()
 
     if not args.project.is_dir():
@@ -697,7 +777,8 @@ def main():
             print(f"#  CONTEXTE : {env}")
             print(f"{'#' * 80}")
             jobs = analyze_recursive(args.project, args.job, env,
-                                     verbose=args.verbose)
+                                     verbose=args.verbose,
+                                     dump_runjobs=args.dump_runjobs)
             if not jobs:
                 print(f"  ⚠ Aucune analyse possible pour {env}", file=sys.stderr)
                 continue
@@ -713,7 +794,8 @@ def main():
         print(f"   Contexte ciblé : Default (disponibles: {', '.join(available)})")
 
     jobs = analyze_recursive(args.project, args.job, resolved_context,
-                             verbose=args.verbose)
+                             verbose=args.verbose,
+                             dump_runjobs=args.dump_runjobs)
 
     if not jobs:
         sys.exit(f"❌ Aucune analyse possible pour le job : {args.job}")
