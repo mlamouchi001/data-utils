@@ -5,12 +5,18 @@ Analyse un job Talend et **tous ses sous-jobs** (`tRunJob`, `tRunJobOnGrid`) pou
 ## Fonctionnalités
 
 - ✅ Parcours récursif des `tRunJob` / `tRunJobOnGrid`
+  - Format plat : `<elementParameter name="PROCESS:PROCESS_TYPE_PROCESS" value="..."/>`
+  - Format imbriqué : `<elementParameter name="PROCESS"><elementValue elementRef="PROCESS_TYPE_PROCESS" .../></elementParameter>`
+  - Référence par ID interne Talend (résolue via les fichiers `.properties`)
 - ✅ Résolution des références `context.XXX` (y compris imbriquées)
 - ✅ Gestion des concaténations Java triviales : `"/tmp/" + context.DIR + "/file.csv"`
 - ✅ Lecture des contextes à deux niveaux : embarqués dans le `.item` du job **et** externes (dossier `context/`)
-- ✅ Sélection de l'environnement : `DEV` / `UAT` / `PRD` / `Default`
+- ✅ Sélection de l'environnement : `dev` / `homol` / `prod` / `DEV` / `UAT` / `PRD` / `Default` — insensible à la casse, validé contre les contextes détectés dans le projet
+- ✅ `--list-contexts` pour découvrir les environnements disponibles
+- ✅ `--all-contexts` pour générer un rapport par environnement en une commande (parfait pour comparer DEV / HOMOL / PROD)
 - ✅ Catalogue étendu de composants : fichiers locaux, FTP/SFTP, GCS, S3, Azure Storage, HDFS
 - ✅ 3 formats de sortie : console, Markdown (Confluence-ready), JSON
+- ✅ Mode `--verbose` pour diagnostiquer la résolution des sous-jobs
 
 ## Prérequis
 
@@ -44,32 +50,48 @@ python talend_io_analyzer.py \
 | Argument | Court | Requis | Description |
 |---|---|---|---|
 | `--project` | `-p` | oui | Répertoire racine du projet Talend (contient `process/`, `context/`, ...) |
-| `--job` | `-j` | oui | Nom du job à analyser (sans le suffixe `_x.y`) |
-| `--context` | `-c` | non | Environnement de contexte — défaut : `Default` |
-| `--format` | `-f` | non | `text` (défaut, console), `markdown` ou `json` |
-| `--output` | `-o` | non | Fichier de sortie pour markdown/json — défaut : `rapport_<job>.md` / `.json` |
+| `--job` | `-j` | oui* | Nom du job à analyser (sans le suffixe `_x.y`). *Optionnel avec `--list-contexts` seul. |
+| `--context` | `-c` | non | Environnement : `dev` / `homol` / `prod` / `DEV` / `UAT` / `PRD` / `Default` ... — insensible à la casse, validé contre les contextes détectés |
+| `--list-contexts` | `-l` | non | Liste les environnements disponibles et sort |
+| `--all-contexts` |  | non | Génère un rapport par environnement détecté (fichiers `rapport_<job>_<env>.<ext>`) |
+| `--format` | `-f` | non | `text` (défaut), `markdown` ou `json` |
+| `--output` | `-o` | non | Fichier de sortie pour markdown/json (ignoré avec `--all-contexts`) |
+| `--verbose` | `-v` | non | Mode diagnostic : résolution des sous-jobs (stderr) |
 
 ### Exemples
 
 ```bash
-# Rapport console rapide
-python talend_io_analyzer.py -p ~/workspaces/PROJ_DLZ -j MAIN_JOB
+# Lister les contextes disponibles dans le projet
+python talend_io_analyzer.py -p ~/workspaces/PROJ_DLZ --list-contexts
 
-# Rapport Markdown avec contexte PRD (prêt pour Confluence)
+# Lister les contextes spécifiques à un job (embarqués + externes)
+python talend_io_analyzer.py -p ~/workspaces/PROJ_DLZ -j MAIN_JOB -l
+
+# Rapport console pour l'environnement HOMOL (insensible à la casse)
+python talend_io_analyzer.py -p ~/workspaces/PROJ_DLZ -j MAIN_JOB -c homol
+
+# Rapport Markdown pour PROD, prêt pour Confluence
 python talend_io_analyzer.py \
     -p ~/workspaces/PROJ_DLZ \
     -j MAIN_JOB \
-    -c PRD \
+    -c prod \
     -f markdown \
-    -o docs/io_MAIN_JOB_prd.md
+    -o docs/io_MAIN_JOB_prod.md
 
-# Export JSON pour intégration aval
+# Un rapport par environnement (dev + homol + prod) en une seule commande
 python talend_io_analyzer.py \
     -p ~/workspaces/PROJ_DLZ \
     -j MAIN_JOB \
-    -c UAT \
-    -f json \
-    -o reports/io_MAIN_JOB_uat.json
+    --all-contexts \
+    -f markdown
+# => génère rapport_MAIN_JOB_dev.md, rapport_MAIN_JOB_homol.md, rapport_MAIN_JOB_prod.md
+
+# Export JSON pour comparaison automatisée entre environnements
+python talend_io_analyzer.py \
+    -p ~/workspaces/PROJ_DLZ \
+    -j MAIN_JOB \
+    --all-contexts \
+    -f json
 ```
 
 ## Exemple de sortie
@@ -192,6 +214,9 @@ Pour capturer aussi `tDBInput` / `tDBOutput` (Snowflake, BigQuery, Teradata, etc
 
 **Chemin résolu bizarre avec des `+`**
 → Probablement une expression Java non triviale (ternaire, appel de méthode). La valeur brute reste affichée à côté pour investigation manuelle.
+
+**Sous-jobs non détectés**
+→ Relancer avec `-v` pour voir, sur stderr, comment chaque `tRunJob` est résolu. Trois formats sont gérés : plat (`PROCESS:PROCESS_TYPE_PROCESS`), imbriqué (`<elementValue elementRef="PROCESS_TYPE_PROCESS"/>`), et ID interne Talend (résolu via les `.properties`). Si un sous-job reste invisible, vérifier que son `.properties` est bien présent dans le périmètre de `--project`.
 
 ## Licence
 
