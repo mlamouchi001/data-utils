@@ -58,6 +58,61 @@ for _stream_name in ("stdout", "stderr"):
             pass
 
 
+def validate_project_dir(raw_path) -> Path:
+    """Valide le chemin et retourne un Path absolu nettoyé.
+    Gère guillemets, espaces non échappés, OneDrive, séparateurs Windows.
+    Si raw_path est une liste (nargs='+'), reconstitue le chemin coupé."""
+    if isinstance(raw_path, list):
+        if len(raw_path) > 1:
+            joined = " ".join(raw_path)
+            print("⚠ Chemin reçu en plusieurs morceaux. Reconstruction :",
+                  file=sys.stderr)
+            print("   " + joined, file=sys.stderr)
+            print('   (Conseil : entourer le chemin de guillemets pour '
+                  'éviter ce comportement : -p "' + joined + '")',
+                  file=sys.stderr)
+            s = joined
+        else:
+            s = raw_path[0]
+    else:
+        s = str(raw_path)
+    s = s.strip()
+    if (s.startswith('"') and s.endswith('"')) or \
+       (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    s = s.rstrip("\\/")
+    if not s:
+        sys.exit("❌ Le chemin du projet est vide.")
+    try:
+        p_resolved = Path(s).expanduser().resolve()
+    except (OSError, RuntimeError) as e:
+        err_msg = "❌ Chemin invalide : " + s
+        err_msg += "\n   Erreur système : " + str(e)
+        sys.exit(err_msg)
+    if not p_resolved.exists():
+        msg = ["❌ Projet introuvable : " + s,
+               "   Chemin résolu  : " + str(p_resolved)]
+        parent = p_resolved.parent
+        if parent.is_dir():
+            siblings = sorted([d.name for d in parent.iterdir()
+                               if d.is_dir()])[:8]
+            msg.append("   Dossiers disponibles dans " + str(parent) + " :")
+            for s_name in siblings:
+                msg.append("     - " + s_name)
+        else:
+            msg.append("   Le parent " + str(parent) + " n'existe pas non plus.")
+            msg.append("   Vérifier les espaces, accents ou caractères "
+                       "spéciaux dans le chemin.")
+        sys.exit("\n".join(msg))
+    if not p_resolved.is_dir():
+        sys.exit("❌ Le chemin existe mais n'est pas un dossier : "
+                 + str(p_resolved))
+    return p_resolved
+
+
+# --------------------------------------------------------------------------
+# Helpers XML namespace-agnostic
+# --------------------------------------------------------------------------
 def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
@@ -510,8 +565,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--project", "-p", required=True, type=Path,
-                        help="Racine du projet Talend")
+    parser.add_argument("--project", "-p", required=True, nargs="+",
+                        help="Racine du projet Talend. Sur Windows, "
+                             "entourer de guillemets si le chemin contient "
+                             "des espaces : -p \"C:\\Mes Projets\\BSY\"")
     parser.add_argument("--lib-dir", "-l", action="append", type=Path,
                         default=[],
                         help="Dossier supplémentaire de JAR à inclure dans la "
@@ -534,19 +591,19 @@ def main():
                         help="Mode diagnostic")
     args = parser.parse_args()
 
-    if not args.project.is_dir():
-        sys.exit(f"❌ Projet introuvable : {args.project}")
+    # Validation du chemin projet avec diagnostic détaillé
+    project_dir = validate_project_dir(args.project)
 
     delimiter = args.delimiter.encode().decode("unicode_escape")
     if len(delimiter) != 1:
         sys.exit("❌ Délimiteur invalide")
 
-    print(f"🔍 Analyse du projet : {args.project}")
+    print(f"🔍 Analyse du projet : {project_dir}")
 
-    lib_dirs = discover_lib_dirs(args.project, args.lib_dir, args.verbose)
+    lib_dirs = discover_lib_dirs(project_dir, args.lib_dir, args.verbose)
     print(f"📚 {len(lib_dirs)} dépôt(s) de librairies trouvé(s)")
 
-    reports, indexed = analyze_project(args.project, lib_dirs, args.verbose)
+    reports, indexed = analyze_project(project_dir, lib_dirs, args.verbose)
 
     if args.format == "text":
         print_report_text(reports, lib_dirs, indexed, args.show_ok_jobs)
