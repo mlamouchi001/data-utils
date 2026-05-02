@@ -106,6 +106,72 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+
+def _is_excluded_path(p) -> bool:
+    """Retourne True si le chemin doit être ignoré du scan (artefacts Maven,
+    dossiers cachés, gestionnaires de version). Évite les FileNotFoundError
+    sur OneDrive et les faux positifs sur les pom.properties Maven."""
+    sp = str(p).replace("\\", "/")
+    if "/target/" in sp or "/META-INF/" in sp or "/poms/" in sp:
+        return True
+    if "/.git/" in sp or "/.svn/" in sp or "/node_modules/" in sp:
+        return True
+    if "/.idea/" in sp or "/.vscode/" in sp:
+        return True
+    return False
+
+def validate_project_dir(raw_path) -> Path:
+    """Valide le chemin et retourne un Path absolu nettoyé.
+    Gère guillemets, espaces non échappés, OneDrive, séparateurs Windows.
+    Si raw_path est une liste (nargs='+'), reconstitue le chemin coupé."""
+    if isinstance(raw_path, list):
+        if len(raw_path) > 1:
+            joined = " ".join(raw_path)
+            print("⚠ Chemin reçu en plusieurs morceaux. Reconstruction :",
+                  file=sys.stderr)
+            print("   " + joined, file=sys.stderr)
+            print('   (Conseil : entourer le chemin de guillemets pour '
+                  'éviter ce comportement : -p "' + joined + '")',
+                  file=sys.stderr)
+            s = joined
+        else:
+            s = raw_path[0]
+    else:
+        s = str(raw_path)
+    s = s.strip()
+    if (s.startswith('"') and s.endswith('"')) or \
+       (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    s = s.rstrip("\\/")
+    if not s:
+        sys.exit("❌ Le chemin du projet est vide.")
+    try:
+        p_resolved = Path(s).expanduser().resolve()
+    except (OSError, RuntimeError) as e:
+        err_msg = "❌ Chemin invalide : " + s
+        err_msg += "\n   Erreur système : " + str(e)
+        sys.exit(err_msg)
+    if not p_resolved.exists():
+        msg = ["❌ Projet introuvable : " + s,
+               "   Chemin résolu  : " + str(p_resolved)]
+        parent = p_resolved.parent
+        if parent.is_dir():
+            siblings = sorted([d.name for d in parent.iterdir()
+                               if d.is_dir()])[:8]
+            msg.append("   Dossiers disponibles dans " + str(parent) + " :")
+            for s_name in siblings:
+                msg.append("     - " + s_name)
+        else:
+            msg.append("   Le parent " + str(parent) + " n'existe pas non plus.")
+            msg.append("   Vérifier les espaces, accents ou caractères "
+                       "spéciaux dans le chemin.")
+        sys.exit("\n".join(msg))
+    if not p_resolved.is_dir():
+        sys.exit("❌ Le chemin existe mais n'est pas un dossier : "
+                 + str(p_resolved))
+    return p_resolved
+
+
 def iter_local(root: ET.Element, name: str):
     """Itère récursivement sur les éléments dont le nom local vaut `name`,
     peu importe le namespace."""
@@ -131,6 +197,8 @@ def find_job_item(project_dir: Path, job_name: str) -> Optional[Path]:
     for item in project_dir.rglob("*.item"):
         # On évite les fichiers de contexte qui sont aussi des .item
         if "/context/" in str(item).replace("\\", "/"):
+            continue
+        if _is_excluded_path(item):
             continue
         if pattern.match(item.name):
             return item
@@ -159,13 +227,31 @@ def build_id_to_name_map(project_dir: Path,
     errors = 0
 
     for props in project_dir.rglob("*.properties"):
-        if "/context/" in str(props).replace("\\", "/"):
+        # Normalisation du chemin pour matcher les exclusions sur Win/Linux
+        sp = str(props).replace("\\", "/")
+
+        # Exclure les contextes Talend
+        if "/context/" in sp:
             continue
+
+        # Exclure les artefacts Maven (target/, META-INF/maven/, pom.properties)
+        # qui contiennent des fichiers non Talend et qui peuvent disparaître
+        # pendant le scan (OneDrive sync, antivirus, build en cours)
+        if "/target/" in sp or "/META-INF/" in sp or props.name == "pom.properties":
+            continue
+
+        # Exclure le dossier poms/ à la racine (projets Talend exportés Maven)
+        if "/poms/" in sp:
+            continue
+
         scanned += 1
         try:
             tree = ET.parse(props)
-        except ET.ParseError:
+        except (ET.ParseError, FileNotFoundError, OSError, PermissionError) as e:
             errors += 1
+            if verbose:
+                print(f"  [debug] ignoré: {props.name} ({type(e).__name__})",
+                      file=sys.stderr)
             continue
 
         root = tree.getroot()
@@ -253,6 +339,8 @@ def find_context_files(project_dir: Path) -> dict[str, Path]:
     """Retourne {nom_du_groupe_de_contexte: chemin_item}."""
     contexts: dict[str, Path] = {}
     for path in project_dir.rglob("*.item"):
+        if _is_excluded_path(path):
+            continue
         if "/context/" not in str(path).replace("\\", "/"):
             continue
         name = re.sub(r"_\d+\.\d+\.item$", "", path.name)
@@ -757,7 +845,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--project", "-p", required=True, type=Path,
+    parser.add_argument("--project", "-p", required=True, nargs="+",
                         help="Répertoire racine du projet Talend "
                              "(contient process/, context/, ...)")
     parser.add_argument("--job", "-j", default=None,
@@ -791,8 +879,7 @@ def main():
                              "détectés.")
     args = parser.parse_args()
 
-    if not args.project.is_dir():
-        sys.exit(f"❌ Le répertoire projet n'existe pas : {args.project}")
+    args.project = validate_project_dir(args.project)
 
     # --list-contexts peut fonctionner sans --job
     if args.list_contexts:
